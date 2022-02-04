@@ -1,4 +1,4 @@
-use datadog_filter::{build_matcher, Matcher, Run};
+use datadog_filter::{build_matcher, fast_matcher, Matcher, Run};
 use datadog_search_syntax::parse;
 use serde::{Deserialize, Serialize};
 use vector_datadog_filter::EventFilter;
@@ -23,12 +23,16 @@ impl_generate_config_from_default!(DatadogSearchConfig);
 /// a Datadog Search Syntax query.
 #[derive(Clone)]
 struct DatadogSearchRunner {
-    matcher: Box<dyn Matcher<Event>>,
+    matcher: fast_matcher::FastMatcher,
 }
 
 impl Condition for DatadogSearchRunner {
     fn check(&self, e: &Event) -> bool {
-        self.matcher.run(e)
+        if let Event::Log(log) = e {
+            EventFilter::run(&self.matcher, log)
+        } else {
+            false
+        }
     }
 }
 
@@ -39,7 +43,7 @@ impl ConditionConfig for DatadogSearchConfig {
         _enrichment_tables: &enrichment::TableRegistry,
     ) -> crate::Result<Box<dyn Condition>> {
         let node = parse(&self.source)?;
-        let matcher = as_log(build_matcher(&node, &EventFilter::default()));
+        let matcher = fast_matcher::build_matcher(&node, &EventFilter::default());
 
         Ok(Box::new(DatadogSearchRunner { matcher }))
     }

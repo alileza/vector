@@ -1,3 +1,4 @@
+pub mod fast_matcher;
 mod filter;
 mod matcher;
 pub mod regex;

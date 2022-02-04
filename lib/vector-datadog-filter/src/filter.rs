@@ -2,14 +2,141 @@ use std::borrow::Cow;
 
 use bytes::Bytes;
 use datadog_filter::{
+    fast_matcher::{FastMatcher, Mode, Op},
     regex::{wildcard_regex, word_regex},
     Filter, Matcher, Resolver, Run,
 };
 use datadog_search_syntax::{Comparison, ComparisonValue, Field};
+use regex::Regex;
 use vector_core::event::{LogEvent, Value};
 
 #[derive(Default, Clone)]
 pub struct EventFilter;
+
+impl EventFilter {
+    pub fn run(matcher: &FastMatcher, log: &LogEvent) -> bool {
+        match &matcher.mode {
+            Mode::One(op) => exec(&op, log),
+            Mode::Any(ops) => ops.iter().any(|op| exec(op, log)),
+            Mode::All(ops) => ops.iter().all(|op| exec(op, log)),
+        }
+    }
+}
+
+fn exec(op: &Op, log: &LogEvent) -> bool {
+    match op {
+        Op::True => true,
+        Op::False => true,
+        Op::Exists(field) => exists(field, log),
+        Op::NotExists(field) => !exists(&field, log),
+        Op::Equals { field, value } => equals(field, value, log),
+        Op::TagExists(value) => tag_exists(value, log),
+        Op::RegexMatch { field, re } => regex_match(field, re, log),
+        Op::Prefix(field, value) => {
+            todo!()
+        }
+        Op::Wildcard(field, value) => {
+            todo!()
+        }
+        Op::Compare(field, comparison, comparison_value) => {
+            todo!()
+        }
+        Op::Range {
+            field,
+            lower,
+            lower_inclusive,
+            upper,
+            upper_inclusive,
+        } => {
+            todo!()
+        }
+        Op::Not(matcher) => {
+            todo!()
+        }
+        Op::Nested(matcher) => EventFilter::run(matcher, log),
+    }
+}
+
+fn exists(field: &Field, log: &LogEvent) -> bool {
+    match field {
+        Field::Tag(tag) => {
+            // println!("exists tag");
+            match log.get("tags") {
+                Some(Value::Array(values)) => values
+                    .iter()
+                    .filter_map(|value| {
+                        if let Value::Bytes(bytes) = value {
+                            std::str::from_utf8(bytes).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .any(|value| {
+                        value == tag
+                            || (value.starts_with(tag) && value.chars().nth(tag.len()) == Some(':'))
+                    }),
+                _ => false,
+            }
+        }
+        // Literal field 'tags' needs to be compared by key.
+        Field::Reserved(field) if field == "tags" => {
+            // println!("exists literal tags");
+            match log.get("tags") {
+                Some(Value::Array(values)) => values
+                    .iter()
+                    .filter_map(|value| {
+                        if let Value::Bytes(bytes) = value {
+                            std::str::from_utf8(bytes).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .any(|value| value == field),
+                _ => false,
+            }
+        }
+        Field::Default(f) | Field::Facet(f) | Field::Reserved(f) => {
+            // println!("exists plain");
+            log.contains(&f)
+        }
+    }
+}
+
+fn equals(field: &str, value: &str, log: &LogEvent) -> bool {
+    // println!("'{field}' equals '{value}'");
+    match log.get(field) {
+        Some(Value::Bytes(s)) => s == value.as_bytes(),
+        _ => false,
+    }
+}
+
+fn tag_exists(to_match: &str, log: &LogEvent) -> bool {
+    // println!("tag exists");
+    match log.get("tags") {
+        Some(Value::Array(values)) => values.iter().any(|value| {
+            if let Value::Bytes(bytes) = value {
+                bytes == to_match.as_bytes()
+            } else {
+                false
+            }
+        }),
+        _ => false,
+    }
+}
+
+fn regex_match(field: &str, re: &Regex, log: &LogEvent) -> bool {
+    // println!("regex");
+    match log.get(field) {
+        Some(Value::Bytes(s)) => {
+            if let Some(s) = std::str::from_utf8(&s).ok() {
+                re.is_match(s)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
 
 /// Uses the default `Resolver`, to build a `Vec<Field>`.
 impl Resolver for EventFilter {}

@@ -8358,6 +8358,7 @@ dependencies = [
  "datadog-filter",
  "datadog-filter-test",
  "datadog-search-syntax",
+ "regex",
  "vector_core",
 ]
 
