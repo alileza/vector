@@ -16,13 +16,13 @@ use super::{create_default_buffer, install_tracing_helpers, with_temp_dir, Undec
 use crate::{
     assert_buffer_size, assert_enough_bytes_written, assert_file_does_not_exist_async,
     assert_file_exists_async, assert_reader_writer_file_positions, await_timeout,
-    disk_v2::{
+    encoding::{AsMetadata, Encodable},
+    variants::disk_v2::{
         backed_archive::BackedArchive,
         record::Record,
         tests::{create_buffer_with_max_data_file_size, SizedRecord},
         ReaderError,
     },
-    encoding::{AsMetadata, Encodable},
     EventCount,
 };
 

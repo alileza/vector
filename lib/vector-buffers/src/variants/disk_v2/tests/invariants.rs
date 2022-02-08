@@ -7,9 +7,8 @@ use super::{
 };
 use crate::{
     assert_buffer_is_empty, assert_buffer_records, assert_buffer_size, assert_enough_bytes_written,
-    assert_reader_writer_file_positions, await_timeout,
-    disk_v2::{common::MAX_FILE_ID, tests::create_default_buffer},
-    set_data_file_length,
+    assert_reader_writer_file_positions, await_timeout, set_data_file_length,
+    variants::disk_v2::{common::MAX_FILE_ID, tests::create_default_buffer},
 };
 
 #[tokio::test]

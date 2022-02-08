@@ -8,7 +8,7 @@ use super::channel::{ReceiverAdapter, SenderAdapter};
 use crate::{
     buffer_usage_data::{BufferUsage, BufferUsageHandle},
     topology::channel::{BufferReceiver, BufferSender},
-    variant::MemoryV1Buffer,
+    variants::MemoryV1Buffer,
     Acker, Bufferable, WhenFull,
 };
 
@@ -250,7 +250,7 @@ where
         when_full: WhenFull,
         usage_handle: BufferUsageHandle,
     ) -> (BufferSender<T>, BufferReceiver<T>) {
-        use crate::variant::MemoryV2Buffer;
+        use crate::variants::MemoryV2Buffer;
 
         let memory_buffer = Box::new(MemoryV2Buffer::new(max_events));
         let (sender, receiver, _) = memory_buffer
@@ -285,7 +285,7 @@ mod tests {
     use super::TopologyBuilder;
     use crate::{
         topology::{builder::TopologyError, test_util::assert_current_send_capacity},
-        variant::MemoryV2Buffer,
+        variants::MemoryV2Buffer,
         WhenFull,
     };
 

@@ -370,10 +370,10 @@ impl Ledger {
     }
 
     /// Tracks the statistics of a successful write.
-    pub fn track_write(&self, record_size: u64) {
+    pub fn track_write(&self, record_len: u64, record_size: u64) {
         self.increment_total_buffer_size(record_size);
         self.usage_handle
-            .increment_received_event_count_and_byte_size(1, record_size);
+            .increment_received_event_count_and_byte_size(record_len, record_size);
     }
 
     /// Tracks the statistics of multiple successful reads.
@@ -501,6 +501,7 @@ impl Ledger {
     /// [`Reader::seek_to_last_record`] and [`Writer::validate_last_write`], otherwise the values
     /// will not be accurate.
     pub fn synchronize_buffer_usage(&self) {
+        // FIXME need to count inside records
         let initial_buffer_events = self.get_total_records();
         let initial_buffer_size = self.get_total_buffer_size();
         self.usage_handle

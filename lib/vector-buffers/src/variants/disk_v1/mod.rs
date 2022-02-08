@@ -1,15 +1,49 @@
+mod acknowledgements;
+mod key;
+mod reader;
+mod writer;
+
+#[cfg(test)]
+mod tests;
+
 use std::{
+    collections::VecDeque,
+    error::Error,
     fmt::Debug,
     io,
+    marker::PhantomData,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize},
+        Arc,
+    },
+    time::Instant,
 };
 
-use snafu::Snafu;
+use async_trait::async_trait;
+use futures::task::AtomicWaker;
+use leveldb::{
+    batch::Writebatch,
+    database::Database,
+    iterator::{Iterable, LevelDBIterator},
+    options::{Options, ReadOptions},
+};
+use parking_lot::Mutex;
+use snafu::{ResultExt, Snafu};
 
-use self::leveldb_buffer::{db_initial_size, Reader, Writer};
-use crate::{buffer_usage_data::BufferUsageHandle, Bufferable};
+use crate::{
+    buffer_usage_data::BufferUsageHandle,
+    topology::{
+        builder::IntoBuffer,
+        channel::{ReceiverAdapter, SenderAdapter},
+    },
+    Acker, Bufferable,
+};
 
-pub mod leveldb_buffer;
+use self::{acknowledgements::create_disk_v1_acker, key::Key, reader::Reader, writer::Writer};
+
+/// How much of disk buffer needs to be deleted before we trigger compaction.
+const MAX_UNCOMPACTED_DENOMINATOR: u64 = 10;
 
 #[derive(Debug, Snafu)]
 pub enum DataDirError {
@@ -29,18 +63,61 @@ pub enum DataDirError {
     },
 }
 
-/// Open a [`leveldb_buffer::Buffer`]
+pub struct DiskV1Buffer {
+    id: String,
+    data_dir: PathBuf,
+    max_size: u64,
+}
+
+impl DiskV1Buffer {
+    pub fn new(id: String, data_dir: PathBuf, max_size: u64) -> Self {
+        DiskV1Buffer {
+            id,
+            data_dir,
+            max_size,
+        }
+    }
+}
+
+#[async_trait]
+impl<T> IntoBuffer<T> for DiskV1Buffer
+where
+    T: Bufferable + Clone,
+{
+    fn provides_instrumentation(&self) -> bool {
+        true
+    }
+
+    async fn into_buffer_parts(
+        self: Box<Self>,
+        usage_handle: BufferUsageHandle,
+    ) -> Result<(SenderAdapter<T>, ReceiverAdapter<T>, Option<Acker>), Box<dyn Error + Send + Sync>>
+    {
+        usage_handle.set_buffer_limits(Some(self.max_size), None);
+
+        // Create the actual buffer subcomponents.
+        let (writer, reader, acker) = open(&self.data_dir, &self.id, self.max_size, usage_handle)?;
+
+        Ok((
+            SenderAdapter::opaque(writer),
+            ReceiverAdapter::opaque(reader),
+            Some(acker),
+        ))
+    }
+}
+
+/// Opens a [`leveldb_buffer::Buffer`].
 ///
 /// # Errors
 ///
 /// This function will fail with [`DataDirError`] if the directory does not exist at
 /// `data_dir`, if permissions are not sufficient etc.
-pub fn open<T>(
+fn open<T>(
     data_dir: &Path,
     name: &str,
     max_size: u64,
     usage_handle: BufferUsageHandle,
-) -> Result<(Writer<T>, Reader<T>, super::Acker), DataDirError>
+) -> Result<(Writer<T>, Reader<T>, Acker), DataDirError>
 where
     T: Bufferable + Clone,
 {
@@ -95,7 +172,7 @@ where
             //
             // If there's no data in the old style path, though, we just delete the directory and move
             // on: no need to emit anything because nothing is being lost.
-            let (old_buffer_size, old_buffer_record_count) = db_initial_size(&old_path)?;
+            let (old_buffer_size, old_buffer_record_count) = db_initial_size::<T>(&old_path)?;
             if old_buffer_size != 0 || old_buffer_record_count != 0 {
                 // The old style path still has some data, so all we're going to do is warn the user
                 // that this is the case, since we don't want to risk reading older records that
@@ -132,7 +209,160 @@ where
         }
     }
 
-    leveldb_buffer::Buffer::build(&path, max_size, usage_handle)
+    build(&path, max_size, usage_handle)
+}
+
+/// Read the byte size and item size of the database
+///
+/// There is a mismatch between leveldb's mechanism and vector's. While vector
+/// would prefer to keep as little in-memory as possible leveldb, being a
+/// database, has the opposite consideration. As such it may mmap 1000 of its
+/// LDB files into vector's address space at a time with no ability for us to
+/// change this number. See [leveldb issue
+/// 866](https://github.com/google/leveldb/issues/866). Because we do need to
+/// know the byte size of our store we are forced to iterate through all the LDB
+/// files on disk, meaning we impose a huge memory burden on our end users right
+/// at the jump in conditions where the disk buffer has filled up. This'll OOM
+/// vector, meaning we're trapped in a catch 22.
+///
+/// This function does not solve the problem -- leveldb will still map 1000
+/// files if it wants -- but we at least avoid forcing this to happen at the
+/// start of vector.
+pub(super) fn db_initial_size<T>(path: &Path) -> Result<(u64, u64), DataDirError>
+where
+    T: Bufferable,
+{
+    let mut options = Options::new();
+    options.create_if_missing = true;
+
+    let db: Database<Key> = Database::open(path, options).with_context(|_| OpenSnafu {
+        data_dir: path.parent().expect("always a parent"),
+    })?;
+
+    let mut byte_size = 0;
+    let mut key_count = 0;
+    let mut first_key = None;
+    let mut last_key = None;
+    for (k, v) in db.iter(ReadOptions::new()) {
+        byte_size += v.len() as u64;
+        key_count += 1;
+
+        if first_key.is_none() {
+            first_key = Some(k.0);
+        }
+        last_key = Some(k.0);
+    }
+
+    // Keys are assigned such that if we write an item that compromises 10 events, and that item has
+    // key K, then the next key we generate will be K+10.  This lets us take the difference between
+    // the last key and the first key to get the number of actual events in the buffer, minus the
+    // events contained in the last key/value pair.  We decode it below to get that, too.
+    let mut item_size = last_key.unwrap_or(0) as u64 - first_key.unwrap_or(0) as u64;
+
+    if last_key.is_some() {
+        let iter = db.iter(ReadOptions::new());
+        iter.seek_to_last();
+        if iter.valid() {
+            let val = iter.value();
+            if let Ok(item) = T::decode(T::get_metadata(), &val[..]) {
+                item_size += item.event_count() as u64;
+            }
+        }
+    }
+
+    debug!(
+        ?first_key,
+        ?last_key,
+        "Read {} key(s) from database, with {} bytes total, comprising {} events total.",
+        key_count,
+        byte_size,
+        item_size
+    );
+
+    Ok((byte_size, item_size))
+}
+
+/// Build a new `DiskBuffer` rooted at `path`
+///
+/// # Errors
+///
+/// Function will fail if the permissions of `path` are not correct, if
+/// there is no space available on disk etc.
+#[allow(clippy::cast_precision_loss)]
+pub fn build<T: Bufferable>(
+    path: &Path,
+    max_size: u64,
+    usage_handle: BufferUsageHandle,
+) -> Result<(Writer<T>, Reader<T>, Acker), DataDirError> {
+    // New `max_size` of the buffer is used for storing the unacked events.
+    // The rest is used as a buffer which when filled triggers compaction.
+    let max_uncompacted_size = max_size / MAX_UNCOMPACTED_DENOMINATOR;
+    let max_size = max_size - max_uncompacted_size;
+
+    let (initial_byte_size, initial_item_size) = db_initial_size::<T>(path)?;
+    usage_handle.increment_received_event_count_and_byte_size(initial_item_size, initial_byte_size);
+
+    let mut options = Options::new();
+    options.create_if_missing = true;
+
+    let db: Database<Key> = Database::open(path, options).with_context(|_| OpenSnafu {
+        data_dir: path.parent().expect("always a parent"),
+    })?;
+    let db = Arc::new(db);
+
+    let head;
+    let tail;
+    {
+        let mut iter = db.keys_iter(ReadOptions::new());
+        head = iter.next().map_or(0, |k| k.0);
+        iter.seek_to_last();
+        tail = if iter.valid() { iter.key().0 + 1 } else { 0 };
+    }
+
+    let current_size = Arc::new(AtomicU64::new(initial_byte_size));
+
+    let write_notifier = Arc::new(AtomicWaker::new());
+
+    let blocked_write_tasks = Arc::new(Mutex::new(Vec::new()));
+
+    let ack_counter = Arc::new(AtomicUsize::new(0));
+    let acker = create_disk_v1_acker(&ack_counter, &write_notifier);
+
+    let writer = Writer {
+        db: Some(Arc::clone(&db)),
+        write_notifier: Arc::clone(&write_notifier),
+        blocked_write_tasks: Arc::clone(&blocked_write_tasks),
+        offset: Arc::new(AtomicUsize::new(tail)),
+        writebatch: Writebatch::new(),
+        batch_size: 0,
+        max_size,
+        current_size: Arc::clone(&current_size),
+        slot: None,
+        usage_handle: usage_handle.clone(),
+    };
+
+    let reader = Reader {
+        db: Arc::clone(&db),
+        write_notifier: Arc::clone(&write_notifier),
+        blocked_write_tasks,
+        read_offset: head,
+        compacted_offset: 0,
+        acked: 0,
+        delete_offset: head,
+        current_size,
+        ack_counter,
+        max_uncompacted_size,
+        uncompacted_size: 0,
+        unacked_keys: VecDeque::new(),
+        buffer: VecDeque::new(),
+        last_compaction: Instant::now(),
+        last_flush: Instant::now(),
+        pending_read: None,
+        usage_handle,
+        phantom: PhantomData,
+    };
+
+    Ok((writer, reader, acker))
 }
 
 fn map_io_error<P>(e: io::Error, data_dir: P) -> DataDirError
@@ -182,44 +412,14 @@ where
         })
 }
 
-fn get_old_style_buffer_dir_name(base: &str) -> String {
+pub(self) fn get_old_style_buffer_dir_name(base: &str) -> String {
     format!("{}_buffer", base)
 }
 
-fn get_new_style_buffer_dir_name(base: &str) -> String {
+pub(self) fn get_new_style_buffer_dir_name(base: &str) -> String {
     format!("{}_id", base)
 }
 
-fn get_sidelined_old_style_buffer_dir_name(base: &str) -> String {
+pub(self) fn get_sidelined_old_style_buffer_dir_name(base: &str) -> String {
     format!("{}_buffer_old", base)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        get_new_style_buffer_dir_name, get_old_style_buffer_dir_name,
-        get_sidelined_old_style_buffer_dir_name,
-    };
-
-    #[test]
-    fn buffer_dir_names() {
-        // I realize that this test might seem silly -- we're just checking that it generates a
-        // string in a certain way -- but ironically, this test existing prior to #10379 may have
-        // saved us from needing the wall of code that's prresent at the top of the file.
-        //
-        // Here, we're simply testing that the "old" style name is suffixed with `_buffer` and that
-        // the "new" style name is suffxed with `_id` to match the current behavior.  To ensure that
-        // what we're testing is actually what's being used to generate buffer directory names,
-        // we've slightly refactored the aforementioned wall of code to use these functions.
-        let old_result = get_old_style_buffer_dir_name("foo");
-        let new_result = get_new_style_buffer_dir_name("foo");
-        let sidelined_old_result = get_sidelined_old_style_buffer_dir_name("foo");
-
-        assert_eq!("foo_buffer", old_result);
-        assert_eq!("foo_id", new_result);
-        assert_eq!("foo_buffer_old", sidelined_old_result);
-        assert_ne!(old_result, new_result);
-        assert_ne!(new_result, sidelined_old_result);
-        assert_ne!(old_result, sidelined_old_result);
-    }
 }

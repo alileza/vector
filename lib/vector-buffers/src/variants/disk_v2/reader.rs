@@ -564,6 +564,7 @@ where
                 .try_into()
                 .expect("number of pending acks should always fit into u64");
 
+            // FIXME count events
             self.ledger.track_reads(ack_count, total_bytes_read);
 
             // Adjust our acknowledgement state, which may also trigger delayed acknowledgements

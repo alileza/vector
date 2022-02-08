@@ -1,8 +1,10 @@
 use std::{
     fmt, mem,
+    pin::Pin,
     task::{Context, Poll},
 };
 
+use futures::Sink;
 use tokio::sync::mpsc::{OwnedPermit, Sender};
 use tokio_util::sync::ReusableBoxFuture;
 
@@ -263,6 +265,27 @@ impl<T> Clone for PollSender<T> {
             // compatible with the transitive bounds required by `Sender<T>`.
             acquire: ReusableBoxFuture::new(async { unreachable!() }),
         }
+    }
+}
+
+impl<T: Send + 'static> Sink<T> for PollSender<T> {
+    type Error = PollSendError<T>;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::into_inner(self).poll_reserve(cx)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+        Pin::into_inner(self).start_send(item)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::into_inner(self).close();
+        Poll::Ready(Ok(()))
     }
 }
 

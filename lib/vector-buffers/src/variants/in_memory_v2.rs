@@ -1,13 +1,12 @@
 use std::error::Error;
 
 use async_trait::async_trait;
-use tokio::sync::mpsc::channel;
 
 use crate::{
     buffer_usage_data::BufferUsageHandle,
     topology::{
         builder::IntoBuffer,
-        channel::{ReceiverAdapter, SenderAdapter},
+        channel::{limited, ReceiverAdapter, SenderAdapter},
     },
     Acker, Bufferable,
 };
@@ -34,7 +33,7 @@ where
     {
         usage_handle.set_buffer_limits(None, Some(self.capacity));
 
-        let (tx, rx) = channel(self.capacity);
+        let (tx, rx) = limited(self.capacity);
         Ok((
             SenderAdapter::channel(tx),
             ReceiverAdapter::channel(rx),

@@ -7,12 +7,10 @@ use tracing_fluent_assertions::{AssertionRegistry, AssertionsLayer};
 use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, Layer, Registry};
 use vector_common::byte_size_of::ByteSizeOf;
 
-use super::Ledger;
+use super::{Buffer, DiskBufferConfig, Ledger, Reader, Writer};
 use crate::{
-    buffer_usage_data::BufferUsageHandle,
-    disk_v2::{Buffer, DiskBufferConfig, Reader, Writer},
-    encoding::FixedEncodable,
-    Acker, Bufferable, EventCount, WhenFull,
+    buffer_usage_data::BufferUsageHandle, encoding::FixedEncodable, Acker, Bufferable, EventCount,
+    WhenFull,
 };
 
 mod acknowledgements;

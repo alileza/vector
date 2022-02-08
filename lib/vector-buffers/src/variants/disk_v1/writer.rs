@@ -2,7 +2,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     task::{Context, Poll, Waker},
 };
@@ -14,6 +14,7 @@ use leveldb::database::{
     options::WriteOptions,
     Database,
 };
+use parking_lot::Mutex;
 
 use super::Key;
 use crate::{buffer_usage_data::BufferUsageHandle, Bufferable};
@@ -104,10 +105,7 @@ where
             if let Some(event) = self.try_send(event) {
                 self.slot = Some(event);
 
-                self.blocked_write_tasks
-                    .lock()
-                    .unwrap()
-                    .push(cx.waker().clone());
+                self.blocked_write_tasks.lock().push(cx.waker().clone());
 
                 if self.current_size.load(Ordering::Acquire) == 0 {
                     // This is a rare case where the reader managed to consume
@@ -138,22 +136,29 @@ impl<T> Writer<T>
 where
     T: Bufferable,
 {
-    fn try_send(&mut self, event: T) -> Option<T> {
+    fn try_send(&mut self, item: T) -> Option<T> {
+        let event_len = item.event_count();
+
+        // Encode the item.
         let mut buffer: BytesMut = BytesMut::with_capacity(64);
-        T::encode(event, &mut buffer).unwrap();
+        T::encode(item, &mut buffer).unwrap();
         let event_size = buffer.len() as u64;
 
+        // Now that we have the encoded size, see if we can fit this item in the buffer given the
+        // current size.  If it won't fit, then give back the item so we can hold on to it and wait
+        // for the reader to make progress.
         if self.current_size.fetch_add(event_size, Ordering::Relaxed) + (event_size / 2)
             > self.max_size
         {
             self.current_size.fetch_sub(event_size, Ordering::Relaxed);
 
-            self.flush();
-
             return Some(T::decode(T::get_metadata(), buffer).unwrap());
         }
 
-        let key = self.offset.fetch_add(1, Ordering::Relaxed);
+        // Generate the key for the item, and increment the offset by the number of events in the
+        // item, which lets us look at the keys present in tehe buffer during initialization and
+        // quickly calculate the total number of events in the buffer.
+        let key = self.offset.fetch_add(event_len, Ordering::Relaxed);
 
         self.writebatch.put(Key(key), &buffer);
         self.batch_size += 1;
@@ -163,7 +168,7 @@ where
         }
 
         self.usage_handle
-            .increment_received_event_count_and_byte_size(1, event_size);
+            .increment_received_event_count_and_byte_size(event_len as u64, event_size);
 
         None
     }

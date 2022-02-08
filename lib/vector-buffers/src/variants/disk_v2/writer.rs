@@ -26,13 +26,10 @@ use tokio::{
 
 use super::{
     common::{create_crc32c_hasher, DiskBufferConfig},
-    record::try_as_record_archive,
+    ledger::Ledger,
+    record::{try_as_record_archive, Record, RecordStatus},
 };
 use crate::{
-    disk_v2::{
-        ledger::Ledger,
-        record::{Record, RecordStatus},
-    },
     encoding::{AsMetadata, Encodable},
     Bufferable,
 };
@@ -286,9 +283,10 @@ where
         }
     }
 
-    fn track_write(&mut self, record_size: u64) {
+    fn track_write(&mut self, record_len: u64, record_size: u64) {
+        // FIXME?
         self.data_file_size += record_size;
-        self.ledger.track_write(record_size);
+        self.ledger.track_write(record_len, record_size);
     }
 
     fn can_write(&mut self) -> bool {
@@ -594,6 +592,7 @@ where
     #[instrument(skip_all, level = "trace")]
     pub async fn write_record(&mut self, record: T) -> Result<usize, WriterError<T>> {
         self.ensure_ready_for_write().await.context(IoSnafu)?;
+        let count = record.event_count();
 
         // Grab the next record ID and attempt to write the record.
         let id = self.ledger.state().get_next_writer_record_id();
@@ -608,7 +607,7 @@ where
         // the writer.  We do this here to avoid consuming record IDs even if a write failed, as we
         // depend on the "record IDs are monotonic" invariant for detecting skipped records during read.
         self.ledger.state().increment_next_writer_record_id();
-        self.track_write(n as u64);
+        self.track_write(count as u64, n as u64);
 
         let file_id = self.ledger.get_current_writer_file_id();
         trace!(
