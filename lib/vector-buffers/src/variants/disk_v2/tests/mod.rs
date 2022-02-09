@@ -1,17 +1,7 @@
-use std::{future::Future, io, path::Path, str::FromStr, sync::Arc};
-
-use bytes::{Buf, BufMut};
-use once_cell::sync::Lazy;
-use temp_dir::TempDir;
-use tracing_fluent_assertions::{AssertionRegistry, AssertionsLayer};
-use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, Layer, Registry};
-use vector_common::byte_size_of::ByteSizeOf;
+use std::{path::Path, sync::Arc};
 
 use super::{Buffer, DiskBufferConfig, Ledger, Reader, Writer};
-use crate::{
-    buffer_usage_data::BufferUsageHandle, encoding::FixedEncodable, Acker, Bufferable, EventCount,
-    WhenFull,
-};
+use crate::{buffer_usage_data::BufferUsageHandle, Acker, Bufferable, WhenFull};
 
 mod acknowledgements;
 mod basic;
@@ -19,16 +9,6 @@ mod invariants;
 mod known_errors;
 mod record;
 mod size_limits;
-
-/*
-    Helper code for getting tracing data from a test:
-
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
-        .with_test_writer()
-        .init();
-*/
 
 #[macro_export]
 macro_rules! assert_buffer_is_empty {
@@ -82,7 +62,7 @@ macro_rules! assert_buffer_size {
 }
 
 #[macro_export]
-macro_rules! assert_reader_writer_file_positions {
+macro_rules! assert_reader_writer_v2_file_positions {
     ($ledger:expr, $reader:expr, $writer:expr) => {{
         let (reader, writer) = $ledger.get_current_reader_writer_file_id();
         assert_eq!(
@@ -112,40 +92,6 @@ macro_rules! assert_enough_bytes_written {
 }
 
 #[macro_export]
-macro_rules! assert_file_does_not_exist_async {
-    ($file_path:expr) => {{
-        let result = tokio::fs::metadata($file_path).await;
-        assert!(result.is_err());
-        assert_eq!(
-            std::io::ErrorKind::NotFound,
-            result.expect_err("is_err() was true").kind(),
-            "got unexpected error kind"
-        );
-    }};
-}
-
-#[macro_export]
-macro_rules! assert_file_exists_async {
-    ($file_path:expr) => {{
-        let result = tokio::fs::metadata($file_path).await;
-        assert!(result.is_ok());
-        assert!(
-            result.expect("is_ok() was true").is_file(),
-            "path exists but is not file"
-        );
-    }};
-}
-
-#[macro_export]
-macro_rules! await_timeout {
-    ($fut:expr, $secs:expr) => {{
-        tokio::time::timeout(std::time::Duration::from_secs($secs), $fut)
-            .await
-            .expect("future should not timeout")
-    }};
-}
-
-#[macro_export]
 macro_rules! set_data_file_length {
     ($path:expr, $start_len:expr, $target_len:expr) => {{
         let mut data_file = OpenOptions::new()
@@ -171,94 +117,7 @@ macro_rules! set_data_file_length {
     }};
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct SizedRecord(pub u32);
-
-impl ByteSizeOf for SizedRecord {
-    fn allocated_bytes(&self) -> usize {
-        self.0 as usize
-    }
-}
-
-impl EventCount for SizedRecord {
-    fn event_count(&self) -> usize {
-        1
-    }
-}
-
-impl FixedEncodable for SizedRecord {
-    type EncodeError = io::Error;
-    type DecodeError = io::Error;
-
-    fn encode<B>(self, buffer: &mut B) -> Result<(), Self::EncodeError>
-    where
-        B: BufMut,
-    {
-        if buffer.remaining_mut() < self.0 as usize + 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "not enough capacity to encode record",
-            ));
-        }
-
-        buffer.put_u32(self.0);
-        buffer.put_bytes(0x42, self.0 as usize);
-        Ok(())
-    }
-
-    fn decode<B>(mut buffer: B) -> Result<SizedRecord, Self::DecodeError>
-    where
-        B: Buf,
-    {
-        let buf_len = buffer.get_u32();
-        buffer.advance(buf_len as usize);
-        Ok(SizedRecord(buf_len))
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct UndecodableRecord;
-
-impl ByteSizeOf for UndecodableRecord {
-    fn allocated_bytes(&self) -> usize {
-        0
-    }
-}
-
-impl EventCount for UndecodableRecord {
-    fn event_count(&self) -> usize {
-        1
-    }
-}
-
-impl FixedEncodable for UndecodableRecord {
-    type EncodeError = io::Error;
-    type DecodeError = io::Error;
-
-    fn encode<B>(self, buffer: &mut B) -> Result<(), Self::EncodeError>
-    where
-        B: BufMut,
-    {
-        if buffer.remaining_mut() < 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "not enough capacity to encode record",
-            ));
-        }
-
-        buffer.put_u32(42);
-        Ok(())
-    }
-
-    fn decode<B>(_buffer: B) -> Result<UndecodableRecord, Self::DecodeError>
-    where
-        B: Buf,
-    {
-        Err(io::Error::new(io::ErrorKind::Other, "failed to decode"))
-    }
-}
-
-pub(crate) async fn create_default_buffer<P, R>(
+pub(crate) async fn create_default_buffer_v2<P, R>(
     data_dir: P,
 ) -> (Writer<R>, Reader<R>, Acker, Arc<Ledger>)
 where
@@ -272,7 +131,7 @@ where
         .expect("should not fail to create buffer")
 }
 
-pub(crate) async fn create_buffer_with_max_buffer_size<P, R>(
+pub(crate) async fn create_buffer_v2_with_max_buffer_size<P, R>(
     data_dir: P,
     max_buffer_size: u64,
 ) -> (Writer<R>, Reader<R>, Acker, Arc<Ledger>)
@@ -291,7 +150,7 @@ where
         .expect("should not fail to create buffer")
 }
 
-pub(crate) async fn create_buffer_with_max_record_size<P, R>(
+pub(crate) async fn create_buffer_v2_with_max_record_size<P, R>(
     data_dir: P,
     max_record_size: usize,
 ) -> (Writer<R>, Reader<R>, Acker, Arc<Ledger>)
@@ -309,7 +168,7 @@ where
         .expect("should not fail to create buffer")
 }
 
-pub(crate) async fn create_buffer_with_max_data_file_size<P, R>(
+pub(crate) async fn create_buffer_v2_with_max_data_file_size<P, R>(
     data_dir: P,
     max_data_file_size: u64,
 ) -> (Writer<R>, Reader<R>, Acker, Arc<Ledger>)
@@ -325,56 +184,4 @@ where
     Buffer::from_config_inner(config, usage_handle)
         .await
         .expect("should not fail to create buffer")
-}
-
-pub(crate) async fn with_temp_dir<F, Fut, V>(f: F) -> V
-where
-    F: FnOnce(&Path) -> Fut,
-    Fut: Future<Output = V>,
-{
-    let buf_dir = TempDir::new().expect("creating temp dir should never fail");
-    f(buf_dir.path()).await
-}
-
-pub fn install_tracing_helpers() -> AssertionRegistry {
-    // TODO: This installs the assertions layer globally, so all tests will run through it.  Since
-    // most of the code being tested overlaps, individual tests should wrap their async code blocks
-    // with a unique span that can be matched on specifically with
-    // `AssertionBuilder::with_parent_name`.
-    //
-    // TODO: We also need a better way of wrapping our test functions in their own parent spans, for
-    // the purpose of isolating their assertions.  Right now, we do it with a unique string that we
-    // have set to the test function name, but this is susceptible to being copypasta'd
-    // unintentionally, thus letting assertions bleed into other tests.
-    //
-    // Maybe we should add a helper method to `tracing-fluent-assertions` for generating a
-    // uniquely-named span that can be passed directly to the assertion builder methods, then it's a
-    // much tighter loop.
-    //
-    // TODO: At some point, we might be able to write a simple derive macro that does this for us, and
-    // configures the other necessary bits, but for now.... by hand will get the job done.
-    static ASSERTION_REGISTRY: Lazy<AssertionRegistry> = Lazy::new(|| {
-        let assertion_registry = AssertionRegistry::default();
-        let assertions_layer = AssertionsLayer::new(&assertion_registry);
-
-        // Constrain the actual output layer to the normal RUST_LOG-based control mechanism, so that
-        // assertions can run unfettered but without also spamming the console with logs.
-        let fmt_filter = std::env::var("RUST_LOG")
-            .map_err(|_| ())
-            .and_then(|s| LevelFilter::from_str(s.as_str()).map_err(|_| ()))
-            .unwrap_or(LevelFilter::OFF);
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_ansi(true)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
-            .with_test_writer()
-            .with_filter(fmt_filter);
-
-        let base_subscriber = Registry::default();
-        let subscriber = base_subscriber.with(assertions_layer).with(fmt_layer);
-
-        tracing::subscriber::set_global_default(subscriber).unwrap();
-        assertion_registry
-    });
-
-    ASSERTION_REGISTRY.clone()
 }

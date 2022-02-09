@@ -7,7 +7,7 @@ use futures::task::AtomicWaker;
 
 use crate::Acker;
 
-pub(super) fn create_disk_v1_acker(
+pub fn create_disk_v1_acker(
     ack_counter: &Arc<AtomicUsize>,
     write_notifier: &Arc<AtomicWaker>,
 ) -> Acker {

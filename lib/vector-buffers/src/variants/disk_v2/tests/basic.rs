@@ -1,8 +1,11 @@
 use tokio_test::{assert_pending, assert_ready, task::spawn};
 use tracing::Instrument;
 
-use super::{create_default_buffer, install_tracing_helpers, with_temp_dir, SizedRecord};
-use crate::{assert_buffer_is_empty, assert_buffer_records};
+use super::create_default_buffer_v2;
+use crate::{
+    assert_buffer_is_empty, assert_buffer_records,
+    test::common::{install_tracing_helpers, with_temp_dir, SizedRecord},
+};
 
 #[tokio::test]
 async fn basic_read_write_loop() {
@@ -11,7 +14,7 @@ async fn basic_read_write_loop() {
 
         async move {
             // Create a regular buffer, no customizations required.
-            let (mut writer, mut reader, acker, ledger) = create_default_buffer(data_dir).await;
+            let (mut writer, mut reader, acker, ledger) = create_default_buffer_v2(data_dir).await;
             assert_buffer_is_empty!(ledger);
 
             let expected_items = (512..768)
@@ -67,7 +70,7 @@ async fn reader_exits_cleanly_when_writer_done_and_in_flight_acks() {
 
         async move {
             // Create a regular buffer, no customizations required.
-            let (mut writer, mut reader, acker, ledger) = create_default_buffer(data_dir).await;
+            let (mut writer, mut reader, acker, ledger) = create_default_buffer_v2(data_dir).await;
             assert_buffer_is_empty!(ledger);
 
             // Now write a single value and close the writer.

@@ -25,7 +25,7 @@ pub mod encoding;
 
 mod internal_events;
 #[cfg(test)]
-mod test;
+pub mod test;
 pub mod topology;
 
 pub(crate) mod variants;

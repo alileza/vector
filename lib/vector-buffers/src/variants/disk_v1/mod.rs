@@ -17,7 +17,6 @@ use std::{
         atomic::{AtomicU64, AtomicUsize},
         Arc,
     },
-    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -30,6 +29,7 @@ use leveldb::{
 };
 use parking_lot::Mutex;
 use snafu::{ResultExt, Snafu};
+use tokio::time::Instant;
 
 use crate::{
     buffer_usage_data::BufferUsageHandle,
@@ -40,7 +40,8 @@ use crate::{
     Acker, Bufferable,
 };
 
-use self::{acknowledgements::create_disk_v1_acker, key::Key, reader::Reader, writer::Writer};
+use self::key::Key;
+pub use self::{acknowledgements::create_disk_v1_acker, reader::Reader, writer::Writer};
 
 /// How much of disk buffer needs to be deleted before we trigger compaction.
 const MAX_UNCOMPACTED_DENOMINATOR: u64 = 10;
@@ -112,7 +113,7 @@ where
 ///
 /// This function will fail with [`DataDirError`] if the directory does not exist at
 /// `data_dir`, if permissions are not sufficient etc.
-fn open<T>(
+pub(self) fn open<T>(
     data_dir: &Path,
     name: &str,
     max_size: u64,

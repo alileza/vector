@@ -12,17 +12,13 @@ use tokio::{
 use tracing::Instrument;
 use vector_common::byte_size_of::ByteSizeOf;
 
-use super::{create_default_buffer, install_tracing_helpers, with_temp_dir, UndecodableRecord};
+use super::{create_buffer_v2_with_max_data_file_size, create_default_buffer_v2};
 use crate::{
     assert_buffer_size, assert_enough_bytes_written, assert_file_does_not_exist_async,
-    assert_file_exists_async, assert_reader_writer_file_positions, await_timeout,
+    assert_file_exists_async, assert_reader_writer_v2_file_positions, await_timeout,
     encoding::{AsMetadata, Encodable},
-    variants::disk_v2::{
-        backed_archive::BackedArchive,
-        record::Record,
-        tests::{create_buffer_with_max_data_file_size, SizedRecord},
-        ReaderError,
-    },
+    test::common::{install_tracing_helpers, with_temp_dir, SizedRecord, UndecodableRecord},
+    variants::disk_v2::{backed_archive::BackedArchive, record::Record, ReaderError},
     EventCount,
 };
 
@@ -33,7 +29,7 @@ async fn reader_throws_error_when_record_length_delimiter_is_zero() {
 
         async move {
             // Create a regular buffer, no customizations required.
-            let (mut writer, _, _, ledger) = create_default_buffer(data_dir.clone()).await;
+            let (mut writer, _, _, ledger) = create_default_buffer_v2(data_dir.clone()).await;
 
             // Write a normal `SizedRecord` record.
             let bytes_written = writer
@@ -80,7 +76,7 @@ async fn reader_throws_error_when_record_length_delimiter_is_zero() {
 
             // Now reopen the buffer and attempt a read, which should return an error for
             // deserialization failure, but specifically that the record length was zero.
-            let (_, mut reader, _, _) = create_default_buffer::<_, SizedRecord>(data_dir).await;
+            let (_, mut reader, _, _) = create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
             match reader.next().await {
                 Err(ReaderError::Deserialization { reason }) => {
                     assert!(reason.ends_with("record length was zero"));
@@ -122,7 +118,7 @@ async fn reader_throws_error_when_finished_file_has_truncated_record_data() {
             // force the writer to roll to another data file and then easily mess with the previous
             // data file.
             let (mut writer, _, _, ledger) =
-                create_buffer_with_max_data_file_size(data_dir.clone(), 128).await;
+                create_buffer_v2_with_max_data_file_size(data_dir.clone(), 128).await;
 
             // Write two smaller records, such that the first one fits entirelyh, and the second one
             // starts within the 128-byte zone but finishes over the limit, thus triggering data
@@ -143,7 +139,7 @@ async fn reader_throws_error_when_finished_file_has_truncated_record_data() {
             // Make sure we're in the right state before doing a third write, which should land in
             // another data file.
             assert_buffer_size!(ledger, 2, expected_first_data_file_len);
-            assert_reader_writer_file_positions!(ledger, 0, 0);
+            assert_reader_writer_v2_file_positions!(ledger, 0, 0);
 
             // Do our third write, which should land in a new data file.
             let third_bytes_written = writer
@@ -157,7 +153,7 @@ async fn reader_throws_error_when_finished_file_has_truncated_record_data() {
                 3,
                 expected_first_data_file_len + third_bytes_written
             );
-            assert_reader_writer_file_positions!(ledger, 0, 1);
+            assert_reader_writer_v2_file_positions!(ledger, 0, 1);
 
             // Now drop the writer/ledger to close the buffer, so we can do some hackin' and
             // slashin' to the first data file. >:D
@@ -195,27 +191,27 @@ async fn reader_throws_error_when_finished_file_has_truncated_record_data() {
             //   read as a valid record, forcing us to skip to the second data file
             // - third read is the third record that we successfully wrote to the second data file
             let (mut writer, mut reader, acker, ledger) =
-                create_default_buffer::<_, SizedRecord>(data_dir).await;
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
             writer.close();
-            assert_reader_writer_file_positions!(ledger, 0, 1);
+            assert_reader_writer_v2_file_positions!(ledger, 0, 1);
 
             let first_read = await_timeout!(reader.next(), 2).expect("read should not fail");
             assert_eq!(first_read, Some(SizedRecord(62)));
-            assert_reader_writer_file_positions!(ledger, 0, 1);
+            assert_reader_writer_v2_file_positions!(ledger, 0, 1);
             acker.ack(1);
 
             let second_read = await_timeout!(reader.next(), 2).expect_err("read should fail");
             assert!(matches!(second_read, ReaderError::PartialWrite));
-            assert_reader_writer_file_positions!(ledger, 1, 1);
+            assert_reader_writer_v2_file_positions!(ledger, 1, 1);
 
             let third_read = await_timeout!(reader.next(), 2).expect("read should not fail");
             assert_eq!(third_read, Some(SizedRecord(64)));
-            assert_reader_writer_file_positions!(ledger, 1, 1);
+            assert_reader_writer_v2_file_positions!(ledger, 1, 1);
             acker.ack(1);
 
             let final_read = await_timeout!(reader.next(), 2).expect("read should not fail");
             assert_eq!(final_read, None);
-            assert_reader_writer_file_positions!(ledger, 1, 1);
+            assert_reader_writer_v2_file_positions!(ledger, 1, 1);
         }
     })
     .await;
@@ -228,7 +224,7 @@ async fn reader_throws_error_when_record_has_scrambled_archive_data() {
 
         async move {
             // Create a regular buffer, no customizations required.
-            let (mut writer, _, _, ledger) = create_default_buffer(data_dir.clone()).await;
+            let (mut writer, _, _, ledger) = create_default_buffer_v2(data_dir.clone()).await;
 
             // Write two `SizedRecord` records just so we can generate enough data.  We need two
             // records because the writer, on start up, will specifically check the last record and
@@ -288,7 +284,7 @@ async fn reader_throws_error_when_record_has_scrambled_archive_data() {
             // Now reopen the buffer and attempt a read, which should return an error for
             // deserialization failure.
             let (_writer, mut reader, _acker, _ledger) =
-                create_default_buffer::<_, SizedRecord>(data_dir).await;
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
             let read_result = reader.next().await;
             assert!(matches!(
                 read_result,
@@ -306,7 +302,8 @@ async fn reader_throws_error_when_record_has_decoding_error() {
 
         async move {
             // Create a regular buffer, no customizations required.
-            let (mut writer, mut reader, _acker, _ledger) = create_default_buffer(data_dir).await;
+            let (mut writer, mut reader, _acker, _ledger) =
+                create_default_buffer_v2(data_dir).await;
 
             // Write an `UndecodableRecord` record which will encode correctly, but always throw an
             // error when attempting to decode.
@@ -339,7 +336,7 @@ async fn writer_detects_when_last_record_has_scrambled_archive_data() {
                 .finalize();
 
             // Create a regular buffer, no customizations required.
-            let (mut writer, _, _, ledger) = create_default_buffer(data_dir.clone()).await;
+            let (mut writer, _, _, ledger) = create_default_buffer_v2(data_dir.clone()).await;
             let starting_writer_file_id = ledger.get_current_writer_file_id();
             let expected_final_writer_file_id = ledger.get_next_writer_file_id();
             let expected_final_write_data_file = ledger.get_next_writer_data_file_path();
@@ -402,9 +399,9 @@ async fn writer_detects_when_last_record_has_scrambled_archive_data() {
             // instructs the writer to skip to the next data file, although this doesn't happen
             // until the first write is attempted.
             let (mut writer, _, _, ledger) =
-                create_default_buffer::<_, SizedRecord>(data_dir).await;
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
             marked_for_skip.assert();
-            assert_reader_writer_file_positions!(ledger, 0, starting_writer_file_id);
+            assert_reader_writer_v2_file_positions!(ledger, 0, starting_writer_file_id);
             assert_file_does_not_exist_async!(&expected_final_write_data_file);
 
             // Do a simple write to ensure it opens the next data file.
@@ -413,7 +410,7 @@ async fn writer_detects_when_last_record_has_scrambled_archive_data() {
                 .await
                 .expect("write should not fail");
             writer.flush().await.expect("flush should not fail");
-            assert_reader_writer_file_positions!(ledger, 0, expected_final_writer_file_id);
+            assert_reader_writer_v2_file_positions!(ledger, 0, expected_final_writer_file_id);
             assert_file_exists_async!(&expected_final_write_data_file);
         }
     });
@@ -437,7 +434,7 @@ async fn writer_detects_when_last_record_has_invalid_checksum() {
                 .finalize();
 
             // Create a regular buffer, no customizations required.
-            let (mut writer, _, _, ledger) = create_default_buffer(data_dir.clone()).await;
+            let (mut writer, _, _, ledger) = create_default_buffer_v2(data_dir.clone()).await;
             let starting_writer_file_id = ledger.get_current_writer_file_id();
             let expected_final_writer_file_id = ledger.get_next_writer_file_id();
             let expected_final_write_data_file = ledger.get_next_writer_data_file_path();
@@ -512,9 +509,9 @@ async fn writer_detects_when_last_record_has_invalid_checksum() {
             // instructs the writer to skip to the next data file, although this doesn't happen
             // until the first write is attempted.
             let (mut writer, _, _, ledger) =
-                create_default_buffer::<_, SizedRecord>(data_dir).await;
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
             marked_for_skip.assert();
-            assert_reader_writer_file_positions!(ledger, 0, starting_writer_file_id);
+            assert_reader_writer_v2_file_positions!(ledger, 0, starting_writer_file_id);
             assert_file_does_not_exist_async!(&expected_final_write_data_file);
 
             // Do a simple write to ensure it opens the next data file.
@@ -523,7 +520,7 @@ async fn writer_detects_when_last_record_has_invalid_checksum() {
                 .await
                 .expect("write should not fail");
             writer.flush().await.expect("flush should not fail");
-            assert_reader_writer_file_positions!(ledger, 0, expected_final_writer_file_id);
+            assert_reader_writer_v2_file_positions!(ledger, 0, expected_final_writer_file_id);
             assert_file_exists_async!(&expected_final_write_data_file);
         }
     });
@@ -547,7 +544,7 @@ async fn writer_detects_when_last_record_wasnt_flushed() {
                 .finalize();
 
             // Create a regular buffer, no customizations required.
-            let (mut writer, _, _, ledger) = create_default_buffer(data_dir.clone()).await;
+            let (mut writer, _, _, ledger) = create_default_buffer_v2(data_dir.clone()).await;
             let starting_writer_file_id = ledger.get_current_writer_file_id();
             let expected_final_writer_file_id = ledger.get_next_writer_file_id();
             let expected_final_write_data_file = ledger.get_next_writer_data_file_path();
@@ -585,9 +582,9 @@ async fn writer_detects_when_last_record_wasnt_flushed() {
             // instructs the writer to skip to the next data file, although this doesn't happen
             // until the first write is attempted.
             let (mut writer, _, _, ledger) =
-                create_default_buffer::<_, SizedRecord>(data_dir).await;
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
             marked_for_skip.assert();
-            assert_reader_writer_file_positions!(ledger, 0, starting_writer_file_id);
+            assert_reader_writer_v2_file_positions!(ledger, 0, starting_writer_file_id);
             assert_file_does_not_exist_async!(&expected_final_write_data_file);
 
             // Do a simple write to ensure it opens the next data file.
@@ -596,7 +593,7 @@ async fn writer_detects_when_last_record_wasnt_flushed() {
                 .await
                 .expect("write should not fail");
             writer.flush().await.expect("flush should not fail");
-            assert_reader_writer_file_positions!(ledger, 0, expected_final_writer_file_id);
+            assert_reader_writer_v2_file_positions!(ledger, 0, expected_final_writer_file_id);
             assert_file_exists_async!(&expected_final_write_data_file);
         }
     });
@@ -622,7 +619,7 @@ async fn writer_detects_when_last_record_was_flushed_but_id_wasnt_incremented() 
                 .finalize();
 
             // Create a regular buffer, no customizations required.
-            let (mut writer, _, _, ledger) = create_default_buffer(data_dir.clone()).await;
+            let (mut writer, _, _, ledger) = create_default_buffer_v2(data_dir.clone()).await;
             let starting_writer_next_record_id = ledger.state().get_next_writer_record_id();
             let expected_final_writer_file_id = ledger.get_current_writer_file_id();
             let expected_final_write_data_file = ledger.get_next_writer_data_file_path();
@@ -658,9 +655,9 @@ async fn writer_detects_when_last_record_was_flushed_but_id_wasnt_incremented() 
             // writer next record ID to be ahead of the actual last record ID, but on whatever we
             // pulled out of the data file.  This is required to maintain our monotonicity invariant
             // for all records written into the buffer.
-            let (_, _, _, ledger) = create_default_buffer::<_, SizedRecord>(data_dir).await;
+            let (_, _, _, ledger) = create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
             writer_did_not_call_reset.assert();
-            assert_reader_writer_file_positions!(ledger, 0, expected_final_writer_file_id);
+            assert_reader_writer_v2_file_positions!(ledger, 0, expected_final_writer_file_id);
             assert_file_does_not_exist_async!(&expected_final_write_data_file);
             assert_eq!(
                 actual_writer_next_record_id,
@@ -737,7 +734,7 @@ async fn reader_throws_error_when_record_is_undecodable_via_metadata() {
 
         async move {
             // Create a regular buffer, no customizations required.
-            let (mut writer, mut reader, _acker, _ledger) = create_default_buffer(data_dir).await;
+            let (mut writer, mut reader, _acker, _ledger) = create_default_buffer_v2(data_dir).await;
 
             // Write two `ControllableRecord` records which will encode with metadata matching our
             // starting metadata state.  We'll then make sure we can read the first one out before

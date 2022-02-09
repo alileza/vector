@@ -1,7 +1,9 @@
 use std::io::Cursor;
 
-use super::SizedRecord;
-use crate::variants::disk_v2::{reader::RecordReader, writer::RecordWriter};
+use crate::{
+    test::common::SizedRecord,
+    variants::disk_v2::{reader::RecordReader, writer::RecordWriter},
+};
 
 #[tokio::test]
 async fn roundtrip_through_record_writer_and_record_reader() {

@@ -8,7 +8,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll, Waker},
-    time::{Duration, Instant},
+    time::Duration, fmt,
 };
 
 use bytes::Bytes;
@@ -21,7 +21,7 @@ use leveldb::database::{
     Database,
 };
 use parking_lot::Mutex;
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time::Instant};
 
 use super::Key;
 use crate::{buffer_usage_data::BufferUsageHandle, Bufferable};
@@ -33,8 +33,14 @@ const MIN_TIME_UNCOMPACTED: Duration = Duration::from_secs(60);
 const MIN_UNCOMPACTED_SIZE: u64 = 4 * 1024 * 1024;
 
 /// How often we flush deletes to the database.
-const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+pub const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Event count for a logical read.
+/// 
+/// As we track all reads, whether or not they can be successfully decoded, we need to track
+/// undecodable reads such that we know that we have to do extra work to correctly figure out how
+/// many events they represented.  This is required to ensure our acknowledgement accounting is
+/// accurate so we can correctly delete only truly acknowledged (or undecodable) records.
 #[derive(Clone, Debug)]
 enum ItemEventCount {
     /// An undecodable item has no known event count until a read which occurs after it is processed,
@@ -45,8 +51,12 @@ enum ItemEventCount {
     Known(usize),
 }
 
+/// A deletion marker for a read that has not yet been fully acknowledged.
+/// 
+/// Used to provide in-order deletion of reads by carrying enough information to figure out when
+/// we've fully acknowledged all events that compromise a given logical read from the buffer.
 #[derive(Clone, Debug)]
-pub(crate) struct PendingDelete {
+pub struct PendingDelete {
     key: usize,
     item_event_count: ItemEventCount,
     item_bytes: usize,
@@ -107,10 +117,6 @@ pub struct Reader<T> {
     pub(crate) usage_handle: BufferUsageHandle,
     pub(crate) phantom: PhantomData<T>,
 }
-
-// Writebatch isn't Send, but the leveldb docs explicitly say that it's okay to
-// share across threads
-unsafe impl<T> Send for Reader<T> where T: Bufferable {}
 
 impl<T> Stream for Reader<T>
 where
@@ -232,8 +238,6 @@ impl<T> Reader<T> {
         item_event_count: ItemEventCount,
         item_bytes: usize,
     ) {
-        trace!(key, item_len = ?item_event_count, item_bytes, "Tracking unacknowledged read.");
-
         // We handle two possible scenarios here: a successful read, or an undecodable read.
         //
         // When a read is successful, we know its actual size in terms of event count and bytes, but
@@ -253,6 +257,9 @@ impl<T> Reader<T> {
             // in the buffer using simple arithmetic between the first and last keys in the buffer.
             ItemEventCount::Known(len) => key + len,
         };
+
+        trace!(key, item_len = ?item_event_count, item_bytes, read_offset = self.read_offset,
+            "Tracking unacknowledged read.");
 
         // Now store a pending delete marker that will eventually be drained in our `try_flush` routine.
         self.unacked_keys.push_back(PendingDelete {
@@ -282,17 +289,6 @@ impl<T> Reader<T> {
                     // acknowledged and we can consume and yield the marker.
                     ItemEventCount::Known(len) => {
                         if marker.key + len <= acked_offset {
-                            // Crucially, we consume from `self.acked` here to ensure that it is adjusted
-                            // correctly.  Why not in `try_flush`, you ask?  Once we're in `try_flush`,
-                            // we're not sure if we're deleting an undecodable item or a valid item, and
-                            // `self.acked` is only concerned with valid items.
-                            //
-                            // It also makes it just a little easier because now `try_flush` can simply call
-                            // this method in a loop until it gets `None`, and blindly delete the keys
-                            // without needing to adjust `self.acked` directly, letting it be blissfully
-                            // unaware of this distinction.
-                            self.acked -= len;
-
                             Some((marker.key, len, marker.item_bytes))
                         } else {
                             None
@@ -332,6 +328,7 @@ impl<T> Reader<T> {
         // Consume any pending acknowledgements.
         let num_to_delete = self.ack_counter.swap(0, Ordering::Relaxed);
         if num_to_delete > 0 {
+            debug!("Consumed {} acknowledgements.", num_to_delete);
             self.acked += num_to_delete;
         }
 
@@ -344,7 +341,10 @@ impl<T> Reader<T> {
         let mut total_item_bytes = 0;
         while let Some((key, item_len, item_bytes)) = self.get_next_deletable_key() {
             delete_batch.delete(Key(key));
-            new_delete_offset = Some(key);
+
+            // Since we know that the key is incremented by the event count for an item, we know
+            // that we've now deleted _up to_ the next key after this one.
+            new_delete_offset = Some(key.wrapping_add(item_len));
 
             total_keys += 1;
             total_items_len += item_len;
@@ -364,6 +364,7 @@ impl<T> Reader<T> {
             self.db.write(WriteOptions::new(), &delete_batch).unwrap();
 
             self.delete_offset = offset;
+            self.acked -= total_items_len;
             assert!(
                 self.delete_offset <= self.read_offset,
                 "tried to ack beyond read offset"
@@ -424,5 +425,29 @@ impl<T> Reader<T> {
             self.compacted_offset = self.delete_offset;
             self.last_compaction = Instant::now();
         }
+    }
+}
+
+impl<T: Bufferable> fmt::Debug for Reader<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reader")
+            .field("db_strong_count", &Arc::strong_count(&self.db))
+            .field("read_offset", &self.read_offset)
+            .field("compacted_offset", &self.compacted_offset)
+            .field("delete_offset", &self.delete_offset)
+            .field("acked", &self.acked)
+            .field("write_notifier", &self.write_notifier)
+            .field("blocked_write_tasks", &self.blocked_write_tasks)
+            .field("current_size", &self.current_size)
+            .field("ack_counter", &self.ack_counter)
+            .field("uncompacted_size", &self.uncompacted_size)
+            .field("unacked_keys", &self.unacked_keys)
+            .field("buffer", &self.buffer)
+            .field("max_uncompacted_size", &self.max_uncompacted_size)
+            .field("last_compaction", &self.last_compaction)
+            .field("last_flush", &self.last_flush)
+            .field("pending_read", &self.pending_read)
+            .field("usage_handle", &self.usage_handle)
+            .finish()
     }
 }
