@@ -125,7 +125,7 @@ impl FixedEncodable for SizedRecord {
         Ok(())
     }
 
-    fn decode<B>(mut buffer: B) -> Result<SizedRecord, Self::DecodeError>
+    fn decode<B>(mut buffer: B) -> Result<Self, Self::DecodeError>
     where
         B: Buf,
     {
@@ -169,7 +169,7 @@ impl FixedEncodable for UndecodableRecord {
         Ok(())
     }
 
-    fn decode<B>(_buffer: B) -> Result<UndecodableRecord, Self::DecodeError>
+    fn decode<B>(_buffer: B) -> Result<Self, Self::DecodeError>
     where
         B: Buf,
     {
@@ -178,7 +178,13 @@ impl FixedEncodable for UndecodableRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct MultiEventRecord(pub usize);
+pub(crate) struct MultiEventRecord(pub u32);
+
+impl MultiEventRecord {
+    pub fn encoded_size(&self) -> usize {
+        usize::try_from(self.0).unwrap_or(usize::MAX) + std::mem::size_of::<u32>()
+    }
+}
 
 impl ByteSizeOf for MultiEventRecord {
     fn allocated_bytes(&self) -> usize {
@@ -188,7 +194,7 @@ impl ByteSizeOf for MultiEventRecord {
 
 impl EventCount for MultiEventRecord {
     fn event_count(&self) -> usize {
-        self.0
+        usize::try_from(self.0).unwrap_or(usize::MAX)
     }
 }
 
@@ -200,24 +206,83 @@ impl FixedEncodable for MultiEventRecord {
     where
         B: BufMut,
     {
-        if buffer.remaining_mut() < self.0 as usize + 4 {
+        if buffer.remaining_mut() < self.encoded_size() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "not enough capacity to encode record",
             ));
         }
 
-        buffer.put_u32(self.0 as u32);
-        buffer.put_bytes(0x42, self.0 as usize);
+        buffer.put_u32(self.0);
+        buffer.put_bytes(0x42, usize::try_from(self.0).unwrap_or(usize::MAX));
         Ok(())
     }
 
-    fn decode<B>(mut buffer: B) -> Result<MultiEventRecord, Self::DecodeError>
+    fn decode<B>(mut buffer: B) -> Result<Self, Self::DecodeError>
     where
         B: Buf,
     {
         let event_count = buffer.get_u32();
-        buffer.advance(event_count as usize);
-        Ok(MultiEventRecord(event_count as usize))
+        buffer.advance(usize::try_from(event_count).unwrap_or(usize::MAX));
+        Ok(MultiEventRecord(event_count))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PoisonPillMultiEventRecord(pub u32);
+
+impl PoisonPillMultiEventRecord {
+    pub fn poisoned() -> Self {
+        Self(42)
+    }
+
+    pub fn encoded_size(&self) -> usize {
+        usize::try_from(self.0).unwrap_or(usize::MAX) + std::mem::size_of::<u32>()
+    }
+}
+
+impl ByteSizeOf for PoisonPillMultiEventRecord {
+    fn allocated_bytes(&self) -> usize {
+        0
+    }
+}
+
+impl EventCount for PoisonPillMultiEventRecord {
+    fn event_count(&self) -> usize {
+        usize::try_from(self.0).unwrap_or(usize::MAX)
+    }
+}
+
+impl FixedEncodable for PoisonPillMultiEventRecord {
+    type EncodeError = io::Error;
+    type DecodeError = io::Error;
+
+    fn encode<B>(self, buffer: &mut B) -> Result<(), Self::EncodeError>
+    where
+        B: BufMut,
+    {
+        if buffer.remaining_mut() < self.encoded_size() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "not enough capacity to encode record",
+            ));
+        }
+
+        buffer.put_u32(self.0);
+        buffer.put_bytes(0x42, usize::try_from(self.0).unwrap_or(usize::MAX));
+        Ok(())
+    }
+
+    fn decode<B>(mut buffer: B) -> Result<Self, Self::DecodeError>
+    where
+        B: Buf,
+    {
+        let event_count = buffer.get_u32();
+        if event_count == 42 {
+            return Err(io::Error::new(io::ErrorKind::Other, "failed to decode"));
+        }
+
+        buffer.advance(usize::try_from(event_count).unwrap_or(usize::MAX));
+        Ok(PoisonPillMultiEventRecord(event_count))
     }
 }

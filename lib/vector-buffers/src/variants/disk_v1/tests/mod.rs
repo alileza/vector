@@ -2,8 +2,12 @@ use std::path::Path;
 
 use futures::StreamExt;
 use tokio_test::{assert_pending, task::spawn};
+use tracing::{Metadata, Span};
 
-use crate::{buffer_usage_data::BufferUsageHandle, Acker, Bufferable, WhenFull, variants::disk_v1::reader::FLUSH_INTERVAL};
+use crate::{
+    buffer_usage_data::BufferUsageHandle, test::common::install_tracing_helpers,
+    variants::disk_v1::reader::FLUSH_INTERVAL, Acker, Bufferable, WhenFull,
+};
 
 use super::{open, Reader, Writer};
 
@@ -15,7 +19,7 @@ mod naming;
 // Default of 1GB.
 const DEFAULT_DISK_BUFFER_V1_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 
-pub(crate) async fn create_default_buffer_v1<P, R>(data_dir: P) -> (Writer<R>, Reader<R>, Acker)
+pub(crate) fn create_default_buffer_v1<P, R>(data_dir: P) -> (Writer<R>, Reader<R>, Acker)
 where
     P: AsRef<Path>,
     R: Bufferable + Clone,
@@ -30,13 +34,54 @@ where
     .expect("should not fail to create buffer")
 }
 
+pub(crate) fn create_default_buffer_v1_with_usage<P, R>(
+    data_dir: P,
+) -> (Writer<R>, Reader<R>, Acker, BufferUsageHandle)
+where
+    P: AsRef<Path>,
+    R: Bufferable + Clone,
+{
+    let usage_handle = BufferUsageHandle::noop(WhenFull::Block);
+    let (writer, reader, acker) = open(
+        data_dir.as_ref(),
+        "disk_buffer_v1",
+        DEFAULT_DISK_BUFFER_V1_SIZE_BYTES,
+        usage_handle.clone(),
+    )
+    .expect("should not fail to create buffer");
+
+    (writer, reader, acker, usage_handle)
+}
+
 async fn drive_reader_to_flush<T: Bufferable>(reader: &mut Reader<T>) {
-    tokio::time::pause();
     tokio::time::advance(FLUSH_INTERVAL).await;
 
+    // If we're currently in a span, we drive the `next` call until we definitively trigger a
+    // `flush`, otherwise, we just call it once.
+    let assertion_registry = install_tracing_helpers();
+    let flush_assert = Span::current()
+        .metadata()
+        .map(Metadata::name)
+        .map(|parent_name| {
+            assertion_registry
+                .build()
+                .with_name("flush")
+                .with_parent_name(parent_name)
+                .was_closed_at_least(2)
+                .finalize()
+        });
+
     let mut staged_read = spawn(async { reader.next().await });
-    assert_pending!(staged_read.poll());
-    drop(staged_read);
+    if let Some(assertion) = flush_assert {
+        while !assertion.try_assert() {
+            assert_pending!(staged_read.poll());
+
+            // We advance the time again because otherwise we won't be able to actually call `flush` again.
+            tokio::time::advance(FLUSH_INTERVAL).await;
+        }
+    } else {
+        assert_pending!(staged_read.poll());
+    }
 }
 
 #[macro_export]

@@ -1,11 +1,3 @@
-// TODO tests:
-// - basic read/write a bunch of records
-// - basic read/write records that are in batches
-// - test ack logic for single event batches and for multi-event batches
-// - test unacked keys when we have one undecodable read only, then undecodable + valid read, then
-//   undecodable + undecodable
-// - test initial size is valid with multi-event records
-
 use futures::{SinkExt, StreamExt};
 
 use super::create_default_buffer_v1;
@@ -21,7 +13,7 @@ async fn ensure_event_count_makes_it_through_unfettered() {
 
         async move {
             // Create a regular buffer, no customizations required.
-            let (mut writer, mut reader, _) = create_default_buffer_v1(data_dir).await;
+            let (mut writer, mut reader, _) = create_default_buffer_v1(data_dir);
             assert_reader_writer_v1_positions!(reader, writer, 0, 0);
 
             // Write a simple multi-event record and make writer offset moves forward by the

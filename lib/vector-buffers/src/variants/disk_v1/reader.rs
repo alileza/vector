@@ -8,7 +8,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll, Waker},
-    time::Duration, fmt,
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -36,7 +36,7 @@ const MIN_UNCOMPACTED_SIZE: u64 = 4 * 1024 * 1024;
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Event count for a logical read.
-/// 
+///
 /// As we track all reads, whether or not they can be successfully decoded, we need to track
 /// undecodable reads such that we know that we have to do extra work to correctly figure out how
 /// many events they represented.  This is required to ensure our acknowledgement accounting is
@@ -52,7 +52,7 @@ enum ItemEventCount {
 }
 
 /// A deletion marker for a read that has not yet been fully acknowledged.
-/// 
+///
 /// Used to provide in-order deletion of reads by carrying enough information to figure out when
 /// we've fully acknowledged all events that compromise a given logical read from the buffer.
 #[derive(Clone, Debug)]
@@ -60,6 +60,15 @@ pub struct PendingDelete {
     key: usize,
     item_event_count: ItemEventCount,
     item_bytes: usize,
+}
+
+/// A deletion marker for a read that is fully acknowledged and can be deleted.
+#[derive(Clone, Debug)]
+struct EligibleDelete {
+    key: usize,
+    item_event_count: usize,
+    item_bytes: usize,
+    acks_to_consume: Option<usize>,
 }
 
 /// The reader side of N to 1 channel through leveldb.
@@ -124,6 +133,7 @@ where
 {
     type Item = T;
 
+    #[cfg_attr(test, instrument(skip(self, cx), level = "debug"))]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
@@ -158,7 +168,10 @@ where
                     Some(mut handle) => match Pin::new(&mut handle).poll(cx) {
                         Poll::Ready(r) => {
                             match r {
-                                Ok(items) => this.buffer.extend(items),
+                                Ok(items) => {
+                                    trace!(batch_size = items.len(), "LevelDB read completed.");
+                                    this.buffer.extend(items);
+                                }
                                 Err(error) => error!(%error, "Error during read."),
                             }
 
@@ -178,10 +191,9 @@ where
             this.pending_read = None;
         }
 
-        if let Some((key, value)) = this.buffer.pop_front() {
-            let item_bytes = value.len();
-            let decode_buf = Bytes::from(value);
-            match T::decode(T::get_metadata(), decode_buf) {
+        if let Some((key, item_bytes, decode_result)) = this.decode_next_record() {
+            trace!(?key, item_bytes, "Got record decode attempt.");
+            match decode_result {
                 Ok(item) => {
                     this.track_unacked_read(
                         key.0,
@@ -192,7 +204,6 @@ where
                 }
                 Err(error) => {
                     error!(%error, "Error deserializing event.");
-                    debug_assert!(false);
 
                     this.track_unacked_read(key.0, ItemEventCount::Unknown, item_bytes);
                     Pin::new(this).poll_next(cx)
@@ -209,7 +220,19 @@ where
 
 impl<T> Drop for Reader<T> {
     fn drop(&mut self) {
-        self.try_flush();
+        self.flush();
+    }
+}
+
+impl<T: Bufferable> Reader<T> {
+    /// Decodes the next buffered record, if one is available.
+    #[cfg_attr(test, instrument(skip(self), level = "trace"))]
+    fn decode_next_record(&mut self) -> Option<(Key, usize, Result<T, T::DecodeError>)> {
+        self.buffer.pop_front().map(|(key, value)| {
+            let item_bytes = value.len();
+            let decode_buf = Bytes::from(value);
+            (key, item_bytes, T::decode(T::get_metadata(), decode_buf))
+        })
     }
 }
 
@@ -277,8 +300,16 @@ impl<T> Reader<T> {
     /// For unacknowledged keys with an unknown event count (items that failed to decode), another
     /// unacknowledged key must be present after it in order to calculate the key offsets and
     /// determine the item length.
-    fn get_next_deletable_key(&mut self) -> Option<(usize, usize, usize)> {
+    #[cfg_attr(test, instrument(skip(self), level = "trace"))]
+    fn get_next_eligible_delete(&mut self) -> Option<EligibleDelete> {
         let acked_offset = self.delete_offset + self.acked;
+
+        trace!(
+            delete_offset = self.delete_offset,
+            acked = self.acked,
+            pending_deletes = self.unacked_keys.len(),
+            "Searching for eligible delete."
+        );
 
         let maybe_marker =
             self.unacked_keys
@@ -289,7 +320,12 @@ impl<T> Reader<T> {
                     // acknowledged and we can consume and yield the marker.
                     ItemEventCount::Known(len) => {
                         if marker.key + len <= acked_offset {
-                            Some((marker.key, len, marker.item_bytes))
+                            Some(EligibleDelete {
+                                key: marker.key,
+                                item_event_count: len,
+                                item_bytes: marker.item_bytes,
+                                acks_to_consume: Some(len),
+                            })
                         } else {
                             None
                         }
@@ -304,8 +340,17 @@ impl<T> Reader<T> {
                     // else.  We just needed to wait for another read to figure out how many items it
                     // accounted for in the buffer.
                     ItemEventCount::Unknown => self.unacked_keys.get(1).map(|next_marker| {
-                        let item_len = next_marker.key - marker.key;
-                        (marker.key, item_len, marker.item_bytes)
+                        let len = next_marker.key - marker.key;
+
+                        // Because we're artificially driving this deletion, there are no
+                        // acknowledgements to actually consume for it.  Doing so would mess up the
+                        // balance between `self.delete_offset`/`self.acked`.
+                        EligibleDelete {
+                            key: marker.key,
+                            item_event_count: len,
+                            item_bytes: marker.item_bytes,
+                            acks_to_consume: None,
+                        }
                     }),
                 });
 
@@ -318,12 +363,24 @@ impl<T> Reader<T> {
     }
 
     /// Attempt to flush any pending deletes to the database.
+    ///
+    /// Flushes are driven based on elapsed time to coalsece operations that require modifying the database.
+    #[cfg_attr(test, instrument(skip(self), level = "trace"))]
     fn try_flush(&mut self) {
         // Don't flush unless we've overrun our flush interval.
         if self.last_flush.elapsed() < FLUSH_INTERVAL {
+            trace!("Last flush was too recent to run again.");
             return;
         }
         self.last_flush = Instant::now();
+
+        self.flush();
+    }
+
+    /// Flushes all eligible deletes to the database.
+    #[cfg_attr(test, instrument(skip(self), level = "trace"))]
+    fn flush(&mut self) {
+        debug!("Running flush.");
 
         // Consume any pending acknowledgements.
         let num_to_delete = self.ack_counter.swap(0, Ordering::Relaxed);
@@ -335,27 +392,40 @@ impl<T> Reader<T> {
         // See if any pending deletes actually qualify for deletion, and if so, capture them and
         // actually execute a batch delete operation.
         let mut delete_batch = Writebatch::new();
-        let mut new_delete_offset = None;
         let mut total_keys = 0;
         let mut total_items_len = 0;
         let mut total_item_bytes = 0;
-        while let Some((key, item_len, item_bytes)) = self.get_next_deletable_key() {
+        while let Some(eligible_delete) = self.get_next_eligible_delete() {
+            let EligibleDelete {
+                key,
+                item_event_count,
+                item_bytes,
+                acks_to_consume,
+            } = eligible_delete;
+
+            // Add this key to our delete batch.
             delete_batch.delete(Key(key));
 
-            // Since we know that the key is incremented by the event count for an item, we know
-            // that we've now deleted _up to_ the next key after this one.
-            new_delete_offset = Some(key.wrapping_add(item_len));
+            // Adjust our delete offset, and if need be, the amount of remaining acknowledgements.
+            //
+            // We adjust the delete offset/remaining acks here so that the next call to
+            // `get_next_eligible_delete` has updated offsets so we can optimally drain as many
+            // eligible deletes as possible in one go.
+            self.delete_offset = key.wrapping_add(item_event_count);
+            if let Some(amount) = acks_to_consume {
+                self.acked -= amount;
+            }
 
             total_keys += 1;
-            total_items_len += item_len;
+            total_items_len += item_event_count;
             total_item_bytes += item_bytes;
         }
 
         // If we actually found anything that was ready to be deleted, execute our delete batch
         // and update our buffer usage metrics.
-        if let Some(offset) = new_delete_offset {
+        if total_keys > 0 {
             debug!(
-                delete_offset = offset,
+                delete_offset = self.delete_offset,
                 "Deleting {} keys from buffer: {} items, {} bytes.",
                 total_keys,
                 total_items_len,
@@ -363,8 +433,6 @@ impl<T> Reader<T> {
             );
             self.db.write(WriteOptions::new(), &delete_batch).unwrap();
 
-            self.delete_offset = offset;
-            self.acked -= total_items_len;
             assert!(
                 self.delete_offset <= self.read_offset,
                 "tried to ack beyond read offset"
@@ -425,29 +493,5 @@ impl<T> Reader<T> {
             self.compacted_offset = self.delete_offset;
             self.last_compaction = Instant::now();
         }
-    }
-}
-
-impl<T: Bufferable> fmt::Debug for Reader<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Reader")
-            .field("db_strong_count", &Arc::strong_count(&self.db))
-            .field("read_offset", &self.read_offset)
-            .field("compacted_offset", &self.compacted_offset)
-            .field("delete_offset", &self.delete_offset)
-            .field("acked", &self.acked)
-            .field("write_notifier", &self.write_notifier)
-            .field("blocked_write_tasks", &self.blocked_write_tasks)
-            .field("current_size", &self.current_size)
-            .field("ack_counter", &self.ack_counter)
-            .field("uncompacted_size", &self.uncompacted_size)
-            .field("unacked_keys", &self.unacked_keys)
-            .field("buffer", &self.buffer)
-            .field("max_uncompacted_size", &self.max_uncompacted_size)
-            .field("last_compaction", &self.last_compaction)
-            .field("last_flush", &self.last_flush)
-            .field("pending_read", &self.pending_read)
-            .field("usage_handle", &self.usage_handle)
-            .finish()
     }
 }

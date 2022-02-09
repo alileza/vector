@@ -1,16 +1,13 @@
-// TODO tests:
-// - test unacked keys when we have one undecodable read only, then undecodable + valid read, then
-//   undecodable + undecodable
-// - test initial size is valid with multi-event records
-
 use std::sync::atomic::Ordering;
 
 use futures::{SinkExt, StreamExt};
 
-use super::create_default_buffer_v1;
+use super::{create_default_buffer_v1, create_default_buffer_v1_with_usage};
 use crate::{
-    test::common::{with_temp_dir, SizedRecord, MultiEventRecord},
-    EventCount, assert_reader_writer_v1_positions, variants::disk_v1::tests::drive_reader_to_flush,
+    assert_reader_writer_v1_positions,
+    test::common::{with_temp_dir, MultiEventRecord, SizedRecord},
+    variants::disk_v1::tests::drive_reader_to_flush,
+    EventCount,
 };
 
 #[tokio::test]
@@ -20,7 +17,7 @@ async fn basic_read_write_loop() {
 
         async move {
             // Create a regular buffer, no customizations required.
-            let (mut writer, mut reader, acker) = create_default_buffer_v1(data_dir).await;
+            let (mut writer, mut reader, acker) = create_default_buffer_v1(data_dir);
             assert_reader_writer_v1_positions!(reader, writer, 0, 0);
 
             let expected_items = (512..768)
@@ -30,7 +27,8 @@ async fn basic_read_write_loop() {
                 .map(SizedRecord)
                 .collect::<Vec<_>>();
             let input_items = expected_items.clone();
-            let expected_position = expected_items.iter()
+            let expected_position = expected_items
+                .iter()
                 .map(EventCount::event_count)
                 .sum::<usize>();
 
@@ -67,29 +65,39 @@ async fn basic_read_write_loop() {
 
             // Drive the reader with one final read which should ensure all acknowledged reads are
             // now flushed, before we check the final reader/writer offsets:
+            tokio::time::pause();
             drive_reader_to_flush(&mut reader).await;
 
             let reader_position = reader.read_offset;
             let delete_position = reader.delete_offset;
-            assert_eq!(expected_position, writer_position,
-                "expected writer offset of {}, got {}", expected_position, writer_position);
-            assert_eq!(expected_position, reader_position,
-                "expected reader offset of {}, got {}", expected_position, reader_position);
-            assert_eq!(expected_position, delete_position,
-                "expected delete offset of {}, got {}", expected_position, delete_position);
+            assert_eq!(
+                expected_position, writer_position,
+                "expected writer offset of {}, got {}",
+                expected_position, writer_position
+            );
+            assert_eq!(
+                expected_position, reader_position,
+                "expected reader offset of {}, got {}",
+                expected_position, reader_position
+            );
+            assert_eq!(
+                expected_position, delete_position,
+                "expected delete offset of {}, got {}",
+                expected_position, delete_position
+            );
         }
     })
     .await;
 }
 
 #[tokio::test]
-async fn basic_read_write_loop_batched() {
+async fn basic_read_write_loop_multievents() {
     with_temp_dir(|dir| {
         let data_dir = dir.to_path_buf();
 
         async move {
             // Create a regular buffer, no customizations required.
-            let (mut writer, mut reader, acker) = create_default_buffer_v1(data_dir).await;
+            let (mut writer, mut reader, acker) = create_default_buffer_v1(data_dir);
 
             let expected_items = (512..768)
                 .into_iter()
@@ -98,7 +106,8 @@ async fn basic_read_write_loop_batched() {
                 .map(MultiEventRecord)
                 .collect::<Vec<_>>();
             let input_items = expected_items.clone();
-            let expected_position = expected_items.iter()
+            let expected_position = expected_items
+                .iter()
                 .map(EventCount::event_count)
                 .sum::<usize>();
 
@@ -132,16 +141,71 @@ async fn basic_read_write_loop_batched() {
 
             // Drive the reader with one final read which should ensure all acknowledged reads are
             // now flushed, before we check the final reader/writer offsets:
+            tokio::time::pause();
             drive_reader_to_flush(&mut reader).await;
 
             let reader_position = reader.read_offset;
             let delete_position = reader.delete_offset;
-            assert_eq!(expected_position, writer_position,
-                "expected writer offset of {}, got {}", expected_position, writer_position);
-            assert_eq!(expected_position, reader_position,
-                "expected reader offset of {}, got {}", expected_position, reader_position);
-            assert_eq!(expected_position, delete_position,
-                "expected delete offset of {}, got {}", expected_position, delete_position);
+            assert_eq!(
+                expected_position, writer_position,
+                "expected writer offset of {}, got {}",
+                expected_position, writer_position
+            );
+            assert_eq!(
+                expected_position, reader_position,
+                "expected reader offset of {}, got {}",
+                expected_position, reader_position
+            );
+            assert_eq!(
+                expected_position, delete_position,
+                "expected delete offset of {}, got {}",
+                expected_position, delete_position
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn initial_size_correct_with_multievents() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            // Create a regular buffer, no customizations required.
+            let (mut writer, _, _) = create_default_buffer_v1(data_dir.clone());
+
+            let input_items = (512..768)
+                .into_iter()
+                .cycle()
+                .take(2000)
+                .map(MultiEventRecord)
+                .collect::<Vec<_>>();
+            let expected_events = input_items
+                .iter()
+                .map(EventCount::event_count)
+                .sum::<usize>();
+            let expected_bytes = input_items
+                .iter()
+                .map(MultiEventRecord::encoded_size)
+                .sum::<usize>();
+
+            // Write a bunch of records so the buffer has events when we reload it.
+            for item in input_items {
+                writer.send(item).await.expect("write should not fail");
+            }
+            writer.flush().await.expect("writer flush should not fail");
+            writer.close().await.expect("writer close should not fail");
+
+            // Now drop our buffer and reopen it.
+            drop(writer);
+            let (_, _, _, usage) =
+                create_default_buffer_v1_with_usage::<_, MultiEventRecord>(data_dir);
+
+            // Make sure our usage data agrees with our expected event count and byte size:
+            let snapshot = usage.snapshot();
+            assert_eq!(expected_events as u64, snapshot.received_event_count);
+            assert_eq!(expected_bytes as u64, snapshot.received_byte_size);
         }
     })
     .await;

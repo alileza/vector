@@ -46,8 +46,7 @@ serde_yaml = { version = "0.8", default-features = false }
 temp-dir = "0.1.11"
 tempdir = "0.3"
 tokio-test = "0.4.2"
-# https://github.com/tobz/tracing-fluent-assertions/pull/1
-tracing-fluent-assertions = { git = "https://github.com/vectordotdev/tracing-fluent-assertions", branch = "bump-tracing-subscriber" }
+tracing-fluent-assertions = { version = "0.3" }
 tracing-subscriber = { version = "0.3.8", default-features = false, features = ["env-filter", "fmt", "registry", "std", "ansi"] }
 
 [[bench]]
