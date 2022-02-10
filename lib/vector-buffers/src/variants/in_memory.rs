@@ -1,29 +1,28 @@
 use std::error::Error;
 
 use async_trait::async_trait;
-use futures::{channel::mpsc::channel, SinkExt};
 
 use crate::{
     buffer_usage_data::BufferUsageHandle,
     topology::{
         builder::IntoBuffer,
-        channel::{ReceiverAdapter, SenderAdapter},
+        channel::{limited, ReceiverAdapter, SenderAdapter},
     },
     Acker, Bufferable,
 };
 
-pub struct MemoryV1Buffer {
+pub struct MemoryBuffer {
     capacity: usize,
 }
 
-impl MemoryV1Buffer {
+impl MemoryBuffer {
     pub fn new(capacity: usize) -> Self {
-        MemoryV1Buffer { capacity }
+        MemoryBuffer { capacity }
     }
 }
 
 #[async_trait]
-impl<T> IntoBuffer<T> for MemoryV1Buffer
+impl<T> IntoBuffer<T> for MemoryBuffer
 where
     T: Bufferable,
 {
@@ -34,10 +33,10 @@ where
     {
         usage_handle.set_buffer_limits(None, Some(self.capacity));
 
-        let (tx, rx) = channel(self.capacity);
+        let (tx, rx) = limited(self.capacity);
         Ok((
-            SenderAdapter::opaque(tx.sink_map_err(|_| ())),
-            ReceiverAdapter::opaque(rx),
+            SenderAdapter::channel(tx),
+            ReceiverAdapter::channel(rx),
             None,
         ))
     }
